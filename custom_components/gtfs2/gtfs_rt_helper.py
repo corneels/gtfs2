@@ -3,6 +3,8 @@ import re
 from datetime import datetime, timedelta
 import json
 import os
+import threading
+import time
 
 import homeassistant.helpers.config_validation as cv
 import homeassistant.util.dt as dt_util
@@ -55,6 +57,7 @@ from .const import (
     DEFAULT_DIRECTION,
     DEFAULT_PATH,
     DEFAULT_PATH_GEOJSON,
+    DEFAULT_RT_CACHE_TTL,
 
     TIME_STR_FORMAT
 )
@@ -86,16 +89,84 @@ def due_in_minutes(timestamp):
     _LOGGER.debug(f"GTFS RT due in minutes, timestamp: %s, now_utc: %s", timestamp, dt_util.utcnow())
     return int(diff.total_seconds() / 60)
 
+# Several entries tend to share one realtime feed (one provider, many routes or
+# stops), and each coordinator refreshes on its own one minute clock, so without
+# sharing every entry downloads and parses the very same feed within seconds of
+# the others. A response is kept per url and headers for DEFAULT_RT_CACHE_TTL and
+# parsed once per label, so N entries on one feed cost one request and one parse,
+# while entries on different feeds, or with different api keys, never mix.
+_rt_cache = {}
+_rt_cache_lock = threading.Lock()
+_rt_key_locks = {}
+
+
+def _rt_cache_key(url, headers):
+    return (url, tuple(sorted((headers or {}).items())))
+
+
+def _rt_key_lock(key):
+    """One lock per feed: an entry asking while another fetches waits for that
+    fetch instead of starting its own."""
+    with _rt_cache_lock:
+        return _rt_key_locks.setdefault(key, threading.Lock())
+
+
+def _get_rt_cache_entry(key, url, headers):
+    """The shared entry for this feed, fetched if missing or older than the ttl.
+    Call while holding _rt_key_lock(key).
+
+    A failed request is shared as well: a provider that times out or refuses
+    would otherwise be asked again by every entry in turn, each waiting out
+    the full timeout behind the lock."""
+    now = time.monotonic()
+    entry = _rt_cache.get(key)
+    if entry is not None and now - entry["at"] < DEFAULT_RT_CACHE_TTL:
+        _LOGGER.debug("GTFS RT using shared response for url: %s", url)
+    else:
+        entry = {"at": now, "response": None, "error": None, "entities": {}}
+        try:
+            entry["response"] = requests.get(url, headers=headers, allow_redirects=True, timeout=20)
+        except Exception as ex:  # pylint: disable=broad-except
+            entry["error"] = ex
+        # aged from when the answer came in, a slow provider still gets the full ttl
+        now = entry["at"] = time.monotonic()
+        with _rt_cache_lock:
+            # drop what has gone stale, a large feed is several MB
+            for old_key in [k for k, v in _rt_cache.items() if now - v["at"] >= DEFAULT_RT_CACHE_TTL]:
+                del _rt_cache[old_key]
+            _rt_cache[key] = entry
+    if entry["error"] is not None:
+        raise entry["error"]
+    return entry
+
+
+def get_rt_response(url: str, headers):
+    """The http response for a realtime url, shared between entries, see _rt_cache."""
+    key = _rt_cache_key(url, headers)
+    with _rt_key_lock(key):
+        return _get_rt_cache_entry(key, url, headers)["response"]
+
+
 def get_gtfs_feed_entities(url: str, headers, label: str):
     _LOGGER.debug(f"GTFS RT get_feed_entities for url: {url} , headers: {headers}, label: {label}")
-    feed = gtfs_realtime_pb2.FeedMessage()  # type: ignore
 
     if url.startswith('file'):
+        # a local file is rewritten by its own entry on each refresh, and
+        # cheap to read, so it is never shared
         requests_session = requests.session()
         requests_session.mount('file://', LocalFileAdapter())
-        response = requests_session.get(url)   
-    else:
-        response = requests.get(url, headers=headers, timeout=20)
+        return _parse_feed_entities(requests_session.get(url), label)
+
+    key = _rt_cache_key(url, headers)
+    with _rt_key_lock(key):
+        entry = _get_rt_cache_entry(key, url, headers)
+        if label not in entry["entities"]:
+            entry["entities"][label] = _parse_feed_entities(entry["response"], label)
+        return entry["entities"][label]
+
+
+def _parse_feed_entities(response, label: str):
+    feed = gtfs_realtime_pb2.FeedMessage()  # type: ignore
 
     if response.status_code == 200 and "Bad Gateway" not in response.text and "Not Found" not in response.text :
         _LOGGER.debug("Successfully updated %s", label)
@@ -518,7 +589,7 @@ def get_gtfs_rt(hass, path, data):
             return "no_rt_data_file" 
         return "ok"                                
     try:
-        r = requests.get(url, headers=_headers, allow_redirects=True, timeout=20)
+        r = get_rt_response(url, _headers)
         open(os.path.join(gtfs_dir, file), "wb").write(r.content)
         if r.status_code != 200:
             _LOGGER.error("Ìssues with downloading GTFS RT data, error: %s, content: %s", r.status_code, r.content)

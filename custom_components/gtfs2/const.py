@@ -11,6 +11,9 @@ DEFAULT_LOCAL_STOP_TIMERANGE = 30
 DEFAULT_LOCAL_STOP_TIMERANGE_HISTORY = 15
 DEFAULT_LOCAL_STOP_RADIUS = 200
 DEFAULT_MAX_LOCAL_STOPS = 15
+# seconds a realtime response is shared between entries asking for the same url,
+# kept under the one minute refresh so an entry on its own never sees older data
+DEFAULT_RT_CACHE_TTL = 30
 
 DEFAULT_NAME = "GTFS Sensor2"
 DEFAULT_PATH = "gtfs2"
