@@ -16,6 +16,11 @@ from .const import (
     DEFAULT_LOCAL_STOP_REFRESH_INTERVAL,
     DEFAULT_LOCAL_STOP_TIMERANGE,
     DEFAULT_LOCAL_STOP_RADIUS,
+    DEFAULT_STOP_DEPARTURES_REFRESH_INTERVAL,
+    DEFAULT_STOP_DEPARTURES_TIMERANGE,
+    DEFAULT_MAX_STOP_DEPARTURES,
+    CONF_DEPARTURE_STOP,
+    CONF_ROUTE_FILTER,
     CONF_API_KEY,
     CONF_API_KEY_NAME,
     CONF_API_KEY_LOCATION,
@@ -27,7 +32,7 @@ from .const import (
     ICON,
     ICONS
 )    
-from .gtfs_helper import get_gtfs, get_next_departure, check_datasource_index, create_trip_geojson, check_extracting, get_local_stops_next_departures, update_route_geojson
+from .gtfs_helper import get_gtfs, get_next_departure, check_datasource_index, create_trip_geojson, check_extracting, get_local_stops_next_departures, get_stop_departures, update_route_geojson
 from .gtfs_rt_helper import get_next_services, get_rt_alerts
 
 _LOGGER = logging.getLogger(__name__)
@@ -198,17 +203,22 @@ class GTFSUpdateCoordinator(DataUpdateCoordinator):
         return self._data
 
 class GTFSLocalStopUpdateCoordinator(DataUpdateCoordinator):
-    """Data update coordinator for getting local stops."""
+    """Data update coordinator for getting local stops, either around a person
+    or zone, or the one stop of a stop departures entry."""
 
     config_entry: ConfigEntry
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         """Initialize the coordinator."""
+        if entry.data.get(CONF_DEPARTURE_STOP):
+            default_interval = DEFAULT_STOP_DEPARTURES_REFRESH_INTERVAL
+        else:
+            default_interval = DEFAULT_LOCAL_STOP_REFRESH_INTERVAL
         super().__init__(
             hass=hass,
             logger=_LOGGER,
             name=entry.entry_id,
-            update_interval=timedelta(minutes=entry.options.get("local_stop_refresh_interval", DEFAULT_LOCAL_STOP_REFRESH_INTERVAL)),
+            update_interval=timedelta(minutes=entry.options.get("local_stop_refresh_interval", default_interval)),
         )
         self.config_entry = entry
         self.hass = hass
@@ -242,11 +252,17 @@ class GTFSLocalStopUpdateCoordinator(DataUpdateCoordinator):
             "name": data["name"],
             "file": data["file"],
             "offset": options["offset"] if "offset" in options else 0,
-            "timerange": options.get("timerange", DEFAULT_LOCAL_STOP_TIMERANGE),
-            "radius": options.get("radius", DEFAULT_LOCAL_STOP_RADIUS),
-            "device_tracker_id": data["device_tracker_id"],
             "extracting": False,
-        }           
+        }
+        if data.get(CONF_DEPARTURE_STOP):
+            self._data["timerange"] = options.get("timerange", DEFAULT_STOP_DEPARTURES_TIMERANGE)
+            self._data["departure_stop"] = data[CONF_DEPARTURE_STOP]
+            self._data["route_filter"] = data.get(CONF_ROUTE_FILTER, [])
+            self._data["max_departures"] = DEFAULT_MAX_STOP_DEPARTURES
+        else:
+            self._data["timerange"] = options.get("timerange", DEFAULT_LOCAL_STOP_TIMERANGE)
+            self._data["radius"] = options.get("radius", DEFAULT_LOCAL_STOP_RADIUS)
+            self._data["device_tracker_id"] = data["device_tracker_id"]
         self._data["gtfs_updated_at"] = dt_util.utcnow().isoformat() 
         
         if check_extracting(self.hass, self.hass.config.path(self._data['gtfs_dir']), self._data['file']):   
@@ -284,9 +300,14 @@ class GTFSLocalStopUpdateCoordinator(DataUpdateCoordinator):
                 #_LOGGER.debug("RT header: %s", self._headers)
 
         try:
-            self._data["local_stops_next_departures"] = await self.hass.async_add_executor_job(
-                    get_local_stops_next_departures, self
-                )
+            if data.get(CONF_DEPARTURE_STOP):
+                self._data["stop_departures"] = await self.hass.async_add_executor_job(
+                        get_stop_departures, self
+                    )
+            else:
+                self._data["local_stops_next_departures"] = await self.hass.async_add_executor_job(
+                        get_local_stops_next_departures, self
+                    )
         except Exception as ex:
             _LOGGER.error("Error getting local stops data: %s", ex)
             raise UpdateFailed(f"Error in getting local stops data: {ex}")

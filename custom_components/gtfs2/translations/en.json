@@ -5,6 +5,7 @@
 		"menu_options": {
           "start_end": "Create schedule on start/end stops",
           "local_stops": "Scheduled departure on stops in your vicinity",
+          "stop_departures": "Live departures from one stop",
 		  "source": "Setup a new data source",
 		  "remove": "Remove an existing data source, e.g. to free up space"
         },
@@ -24,6 +25,31 @@
         },
         "description": "Select from existing sources in your gtfs2 folder [(docu)]({docu_local_stops})"
       },	  
+      "stop_departures": {
+        "data": {
+          "file": "Select source",
+          "name": "Name of the sensor"
+        },
+        "description": "A live timetable of the departures from one stop, optionally only for some lines"
+      },
+      "stop_search": {
+        "data": {
+          "stop_search": "Stop name, code or id"
+        },
+        "description": "Part of the name is enough, e.g. 'Central'. Each stop found is shown with the lines leaving from it"
+      },
+      "stop_pick": {
+        "data": {
+          "departure_stop": "Stop"
+        },
+        "description": "A street often has a stop on each side, one per direction: the lines and their destinations tell them apart. A station includes all of its platforms"
+      },
+      "stop_routes": {
+        "data": {
+          "route_filter": "Only these lines (leave empty for all)"
+        },
+        "description": "Each line is listed per direction with its destination, as one stop can be served both ways"
+      },
       "source": {
         "data": {
           "file": "New datasource name",
@@ -89,6 +115,7 @@
       }	
     },
     "error": {
+      "no_stop_found": "No stop found, try another part of its name, its code or its id",
       "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]",
       "invalid_auth": "[%key:common::config_flow::error::invalid_auth%]",
       "unknown": "[%key:common::config_flow::error::unknown%]",
@@ -98,6 +125,7 @@
 	  "no_zip_file": "Data collection issue: ZIP file not in the correct folder"
     },
     "abort": {
+      "no_departures_at_stop": "No departures from this stop in the datasource",
       "already_configured": "[%key:common::config_flow::abort::already_configured_device%]",
       "files_deleted": "Datasource deleted, this may affect existing routes",
       "stop_incorrect": "Start and/or End destination incorrect, \n possibly no transport 'today' or not in same direction, \n please check logs",

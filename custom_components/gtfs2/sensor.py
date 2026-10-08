@@ -40,6 +40,8 @@ from .const import (
     ATTR_TIMEZONE_ORIGIN,
     ATTR_TIMEZONE_DESTINATION,
     BICYCLE_ALLOWED_DEFAULT,
+    CONF_DEPARTURE_STOP,
+    CONF_ROUTE_FILTER,
     BICYCLE_ALLOWED_OPTIONS,
     DEFAULT_NAME,
     DOMAIN,
@@ -71,7 +73,14 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
     ) -> None:
     """Initialize the setup."""   
-    if config_entry.data.get('device_tracker_id',None):
+    if config_entry.data.get(CONF_DEPARTURE_STOP, None):
+        coordinator: GTFSLocalStopUpdateCoordinator = hass.data[DOMAIN][config_entry.entry_id][
+           "coordinator"
+        ]
+        await coordinator.async_config_entry_first_refresh()
+        sensors = [GTFSStopDeparturesSensor(coordinator)]
+
+    elif config_entry.data.get('device_tracker_id',None):
         sensors = []
         coordinator: GTFSLocalStopUpdateCoordinator = hass.data[DOMAIN][config_entry.entry_id][
            "coordinator"
@@ -584,3 +593,66 @@ class GTFSLocalStopSensor(CoordinatorEntity, SensorEntity):
                     
         self._attr_extra_state_attributes = self._attributes
         return self._attr_extra_state_attributes
+
+
+class GTFSStopDeparturesSensor(CoordinatorEntity, SensorEntity):
+    """The live timetable of one stop: the state is the next departure, the
+    attributes the departures ahead, realtime where the entry has it."""
+
+    # named after its device, as GTFSDepartureSensor
+    _attr_has_entity_name = True
+    _attr_name = None
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    # the list changes every minute and soon outgrows what the recorder keeps
+    _unrecorded_attributes = frozenset({"departures"})
+
+    def __init__(self, coordinator) -> None:
+        """Initialize the GTFSsensor."""
+        super().__init__(coordinator)
+        self._name = coordinator.config_entry.data["name"]
+        self._attr_unique_id = f"gtfs-stop-{coordinator.config_entry.entry_id}"
+        self._attr_device_info = DeviceInfo(
+            name=f"GTFS - {self._name}",
+            entry_type=DeviceEntryType.SERVICE,
+            identifiers={(DOMAIN, f"GTFS - {self._name}")},
+            manufacturer="GTFS",
+            model=self._name,
+        )
+        self._update_attrs()
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Handle updated data from the coordinator."""
+        self._update_attrs()
+        super()._handle_coordinator_update()
+
+    def _update_attrs(self):
+        data = self.coordinator.data
+        stop = self.coordinator.config_entry.data[CONF_DEPARTURE_STOP]
+        self._attr_icon = "mdi:bus-stop"
+        if data.get("extracting"):
+            _LOGGER.warning("Extracting datasource: %s ,for sensor: %s", data["file"], self._name)
+            self._attr_native_value = None
+            self._attr_extra_state_attributes = {"extracting": True}
+            return
+
+        departures = data.get("stop_departures") or []
+        if departures:
+            first = departures[0]
+            # the realtime departure when the feed has one, else the timetable
+            if isinstance(first["departure_realtime_datetime"], datetime):
+                self._attr_native_value = first["departure_realtime_datetime"]
+            else:
+                self._attr_native_value = first["departure_datetime"]
+            self._attr_icon = first.get("icon") or self._attr_icon
+        else:
+            self._attr_native_value = None
+
+        self._attr_extra_state_attributes = {
+            "stop_id": stop.split(": ", 1)[0],
+            "stop_name": stop.split(": ", 1)[-1],
+            "route_filter": self.coordinator.config_entry.data.get(CONF_ROUTE_FILTER, []),
+            "offset": data.get("offset"),
+            "gtfs_updated_at": data.get("gtfs_updated_at"),
+            "departures": departures,
+        }

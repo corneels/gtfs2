@@ -49,7 +49,12 @@ from .const import (
     CONF_REAL_TIME,
     ATTR_API_KEY_LOCATIONS,
     DEFAULT_MAX_LOCAL_STOPS,
-    CONF_MAX_LOCAL_STOPS
+    CONF_MAX_LOCAL_STOPS,
+    DEFAULT_STOP_DEPARTURES_REFRESH_INTERVAL,
+    DEFAULT_STOP_DEPARTURES_TIMERANGE,
+    CONF_STOP_SEARCH,
+    CONF_DEPARTURE_STOP,
+    CONF_ROUTE_FILTER
 )    
 
 from .gtfs_helper import (
@@ -66,7 +71,9 @@ from .gtfs_helper import (
     get_agency_list,
     get_local_stop_list,
     get_train_station_list,
-    get_train_destination_list
+    get_train_destination_list,
+    get_stop_search_list,
+    get_stop_route_list
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -107,6 +114,8 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         # the destination screen and picks a loop's rotation, the entry does
         # not keep it
         self._towards = None
+        # the stops a stop departures search found, offered on the next screen
+        self._stop_options = []
 
     async def async_step_user(self, user_input: dict | None = None) -> FlowResult:
         """Handle the source."""
@@ -114,7 +123,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         
         return self.async_show_menu(
             step_id="user",
-            menu_options=["start_end", "local_stops", "source","remove"],
+            menu_options=["start_end", "local_stops", "stop_departures", "source","remove"],
             description_placeholders=TRANSLATION_DESCRIPTION_PLACEHOLDERS,
         )
                    
@@ -170,6 +179,102 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 title=user_input[CONF_NAME], data=self._user_inputs
                 )                
                    
+    async def async_step_stop_departures(self, user_input: dict | None = None) -> FlowResult:
+        """A stop's live timetable: the source and the name of the entry."""
+        if user_input is None:
+            datasources = await get_datasources(self.hass, DEFAULT_PATH)
+            return self.async_show_form(
+                step_id="stop_departures",
+                data_schema=vol.Schema(
+                    {
+                        vol.Required(CONF_FILE, default=""): vol.In(datasources),
+                        vol.Required(CONF_NAME): str,
+                    },
+                ),
+                description_placeholders=TRANSLATION_DESCRIPTION_PLACEHOLDERS,
+            )
+        user_input[CONF_URL] = "na"
+        user_input[CONF_EXTRACT_FROM] = "zip"
+        self._user_inputs.update(user_input)
+        _LOGGER.debug(f"UserInputs Stop Departures: {self._user_inputs}")
+        check_data = await self._check_data(self._user_inputs)
+        if check_data:
+            return self.async_abort(reason=check_data, description_placeholders=TRANSLATION_DESCRIPTION_PLACEHOLDERS)
+        return await self.async_step_stop_search()
+
+    async def async_step_stop_search(self, user_input: dict | None = None) -> FlowResult:
+        """Find the stop by name, code or id: a feed holds far too many
+        stops to pick from one list."""
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            self._stop_options = await self.hass.async_add_executor_job(
+                get_stop_search_list, self._pygtfs, user_input[CONF_STOP_SEARCH]
+            )
+            if self._stop_options:
+                return await self.async_step_stop_pick()
+            errors["base"] = "no_stop_found"
+        return self.async_show_form(
+            step_id="stop_search",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_STOP_SEARCH): str,
+                },
+            ),
+            description_placeholders=TRANSLATION_DESCRIPTION_PLACEHOLDERS,
+            errors=errors,
+        )
+
+    async def async_step_stop_pick(self, user_input: dict | None = None) -> FlowResult:
+        """Pick the stop among those found, each shown with its lines."""
+        if user_input is None:
+            return self.async_show_form(
+                step_id="stop_pick",
+                data_schema=vol.Schema(
+                    {
+                        vol.Required(CONF_DEPARTURE_STOP): selector.SelectSelector(
+                            selector.SelectSelectorConfig(
+                                options=[selector.SelectOptionDict(**stop) for stop in self._stop_options],
+                                mode=selector.SelectSelectorMode.LIST,
+                            )
+                        ),
+                    },
+                ),
+                description_placeholders=TRANSLATION_DESCRIPTION_PLACEHOLDERS,
+            )
+        self._user_inputs.update(user_input)
+        _LOGGER.debug(f"UserInputs Stop Pick: {self._user_inputs}")
+        return await self.async_step_stop_routes()
+
+    async def async_step_stop_routes(self, user_input: dict | None = None) -> FlowResult:
+        """Optionally keep only some lines, each way round on its own: a stop
+        can be served in both directions, so a line alone is not enough."""
+        if user_input is None:
+            routes = await self.hass.async_add_executor_job(
+                get_stop_route_list, self._pygtfs, self._user_inputs[CONF_DEPARTURE_STOP]
+            )
+            if not routes:
+                return self.async_abort(reason="no_departures_at_stop")
+            return self.async_show_form(
+                step_id="stop_routes",
+                data_schema=vol.Schema(
+                    {
+                        vol.Optional(CONF_ROUTE_FILTER, default=[]): selector.SelectSelector(
+                            selector.SelectSelectorConfig(
+                                options=[selector.SelectOptionDict(**route) for route in routes],
+                                multiple=True,
+                                mode=selector.SelectSelectorMode.DROPDOWN,
+                            )
+                        ),
+                    },
+                ),
+                description_placeholders=TRANSLATION_DESCRIPTION_PLACEHOLDERS,
+            )
+        self._user_inputs[CONF_ROUTE_FILTER] = user_input.get(CONF_ROUTE_FILTER, [])
+        _LOGGER.debug(f"UserInputs Stop Routes: {self._user_inputs}")
+        return self.async_create_entry(
+            title=self._user_inputs[CONF_NAME], data=self._user_inputs
+        )
+
     async def async_step_source(self, user_input: dict | None = None) -> FlowResult:
         """Handle a flow initialized by the user."""
         errors: dict[str, str] = {}
@@ -646,6 +751,20 @@ class GTFSOptionsFlowHandler(config_entries.OptionsFlow):
                 _LOGGER.debug(f"UserInputs Options Init without realtime: {self._user_inputs}")
                 return self.async_create_entry(title="", data=self._user_inputs)
         
+        if self.config_entry.data.get(CONF_DEPARTURE_STOP, None):
+            opt1_schema = {
+                    vol.Optional(CONF_LOCAL_STOP_REFRESH_INTERVAL, default=self.config_entry.options.get(CONF_LOCAL_STOP_REFRESH_INTERVAL, DEFAULT_STOP_DEPARTURES_REFRESH_INTERVAL)): vol.All(vol.Coerce(int), vol.Range(min=1)),
+                    vol.Optional(CONF_TIMERANGE, default=self.config_entry.options.get(CONF_TIMERANGE, DEFAULT_STOP_DEPARTURES_TIMERANGE)): vol.All(vol.Coerce(int), vol.Range(min=15, max=720)),
+                    vol.Optional(CONF_OFFSET, default=self.config_entry.options.get(CONF_OFFSET, DEFAULT_OFFSET)): int,
+                    vol.Optional(CONF_REAL_TIME, default=self.config_entry.options.get(CONF_REAL_TIME)): selector.BooleanSelector()
+                }
+            return self.async_show_form(
+                step_id="init",
+                data_schema=vol.Schema(opt1_schema),
+                description_placeholders=TRANSLATION_DESCRIPTION_PLACEHOLDERS,
+                errors = errors
+            )
+
         if self.config_entry.data.get(CONF_DEVICE_TRACKER_ID, None):
             opt1_schema = {
                     vol.Optional(CONF_LOCAL_STOP_REFRESH_INTERVAL, default=self.config_entry.options.get(CONF_LOCAL_STOP_REFRESH_INTERVAL, DEFAULT_LOCAL_STOP_REFRESH_INTERVAL)): int,
@@ -684,7 +803,8 @@ class GTFSOptionsFlowHandler(config_entries.OptionsFlow):
             _LOGGER.debug(f"UserInput Realtime: {self._user_inputs}")
             return self.async_create_entry(title="", data=self._user_inputs)
 
-        if self.config_entry.data.get(CONF_DEVICE_TRACKER_ID, None):
+        # stop entries read realtime the way local stops do: trip updates only
+        if self.config_entry.data.get(CONF_DEVICE_TRACKER_ID, None) or self.config_entry.data.get(CONF_DEPARTURE_STOP, None):
             return self.async_show_form(
                 step_id="real_time",
                 data_schema=vol.Schema(
