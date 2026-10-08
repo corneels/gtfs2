@@ -7,6 +7,7 @@
 
 - Schedule a **route** between self-defined start/end stops
 - Schedule all (multi-route) departures from stops in a self-defined zone/area or (dynamically) around a device
+- Live **departures from one stop** (or a station with all its platforms), optionally only for some lines and directions
 - Option to add realtime gtfs **realtime trip updates**, **realtime vehicle location**,  **realtime alerts**, depends on the offering from your provider
 - With realtime vehicle location, geojson files allow to visualize and track vehicles on a map card
 - Services/actions to support automated processes, e.g. update the GTFSs of static and real time data

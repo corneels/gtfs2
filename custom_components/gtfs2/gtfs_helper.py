@@ -31,6 +31,7 @@ from .const import (
     DEFAULT_LOCAL_STOP_TIMERANGE, 
     DEFAULT_LOCAL_STOP_TIMERANGE_HISTORY,
     DEFAULT_LOCAL_STOP_RADIUS,
+    DEFAULT_STOP_DEPARTURES_TIMERANGE,
     DEFAULT_PATH_RT,
     DEFAULT_PATH,
     ICON,
@@ -1800,8 +1801,21 @@ def _build_local_stop_element(self, row, base_datetime,
     }                
 
 def _fetch_local_stop_rows(schedule, latitude, longitude, radius,
-                            time_range, time_range_history, now):
-    """Run the local-stop SQL query and return plain dicts. """
+                            time_range, time_range_history, now, stop_id=None):
+    """Run the local-stop SQL query and return plain dicts.
+
+    With a stop_id the stops are that stop and, for a station, its platforms,
+    instead of those around latitude/longitude; and a trip that ends there is
+    left out, as it only arrives and a departures board has no use for it."""
+    if stop_id is None:
+        stop_condition = "abs(stop.stop_lat - :latitude) < :radius AND abs(stop.stop_lon - :longitude) < :radius"
+        trip_condition = ""
+    else:
+        stop_condition = "stop.stop_id IN (SELECT stop_id FROM stops WHERE stop_id = :stop_id OR parent_station = :stop_id)"
+        trip_condition = """WHERE EXISTS (
+              SELECT 1 FROM stop_times later
+              WHERE later.trip_id = st.trip_id AND later.stop_sequence > st.stop_sequence
+            )"""
     ## QUERY candidate_stops and candidate_dates are used to construct a list of valid_dates, i.e a list where services run
     ## valid_dates is then used in the main query
     sql_query = f"""    
@@ -1817,9 +1831,10 @@ def _fetch_local_stop_rows(schedule, latitude, longitude, radius,
             FROM trips trip
             INNER JOIN stop_times st ON trip.trip_id = st.trip_id
             INNER JOIN stops stop ON stop.stop_id = st.stop_id
-              AND abs(stop.stop_lat - :latitude) < :radius AND abs(stop.stop_lon - :longitude) < :radius
+              AND {stop_condition}
             INNER JOIN routes route ON route.route_id = trip.route_id
             INNER JOIN agency agency ON route.agency_id = agency.agency_id
+            {trip_condition}
           ),
           candidate_dates(date) AS (
             SELECT date(:now_offset, '-1 day')
@@ -1878,13 +1893,14 @@ def _fetch_local_stop_rows(schedule, latitude, longitude, radius,
         "timerange_history": time_range_history,
         "radius": radius,
         "now_offset": now,
+        "stop_id": stop_id,
     }
 
     _LOGGER.debug("SQL statement:\n%s", sql_query)
     _LOGGER.debug("SQL parameters:\n%s", query_params)        
 
     with schedule.engine.connect() as conn:
-        rows = conn.execute(text(sql_query), {"latitude": latitude, "longitude": longitude, "timerange": time_range, "timerange_history": time_range_history, "radius": radius, "now_offset": now}).fetchall()
+        rows = conn.execute(text(sql_query), query_params).fetchall()
 
     data_returned = [row_cursor._asdict() for row_cursor in rows]
     _LOGGER.debug("Local stop rows returned: %s", data_returned)
@@ -2019,6 +2035,123 @@ def get_local_stops_next_departures(self):
         schedule, latitude, longitude, radius, time_range, time_range_history, now
     )
     return _interpret_local_stop_rows(self, rows)
+
+
+def _stop_id_of(entry):
+    """The stop id of a picker entry "stop_id: Name"."""
+    return entry.split(": ", 1)[0]
+
+
+def route_direction_key(route_id, direction_id):
+    """One line in one direction at a stop, as the route filter keeps it.
+
+    A stop is not tied to a direction in GTFS: one pole can be served both
+    ways (a loop, a terminus, a platform trains leave in either direction),
+    so filtering on the route alone could keep departures the rider does not
+    want. direction_id is optional and only means something within its own
+    route, hence the pair, with an empty direction when the feed has none."""
+    return f"{route_id}##{'' if direction_id in (None, '') else direction_id}"
+
+
+def _filter_stop_rows(rows, route_filter):
+    """The rows of the lines kept by the route filter, all when there is none."""
+    if not route_filter:
+        return rows
+    wanted = set(route_filter)
+    return [row for row in rows if route_direction_key(row["route_id"], row["direction_id"]) in wanted]
+
+
+def _stop_departures_of(stops, max_departures):
+    """The departures of a stop's platforms as one list, soonest first."""
+    departures = [departure for stop in stops for departure in stop["departure"]]
+    departures.sort(key=lambda d: d["departure_datetime"])
+    return departures[:max_departures]
+
+
+def get_stop_search_list(schedule, search, limit=50):
+    """Stops and stations matching a name, code or id, labelled with the lines
+    that leave from them, so the two sides of one street can be told apart."""
+    sql_stops = """
+        SELECT DISTINCT stop_id, stop_name, stop_code, platform_code, location_type
+        FROM stops
+        WHERE (stop_name LIKE :like OR stop_id = :search OR stop_code = :search)
+          AND coalesce(location_type, 0) IN (0, 1)
+        ORDER BY stop_name, stop_id
+        LIMIT :limit
+        """
+    sql_lines = """
+        SELECT DISTINCT coalesce(nullif(route.route_short_name, ''), route.route_long_name) AS line,
+               trip.trip_headsign AS headsign
+        FROM stop_times st
+        INNER JOIN trips trip ON trip.trip_id = st.trip_id
+        INNER JOIN routes route ON route.route_id = trip.route_id
+        WHERE st.stop_id IN (SELECT stop_id FROM stops WHERE stop_id = :stop_id OR parent_station = :stop_id)
+        ORDER BY line, headsign
+        """
+    search = search.strip()
+    stop_list = []
+    with schedule.engine.connect() as conn:
+        stops = conn.execute(text(sql_stops), {"like": f"%{search}%", "search": search, "limit": limit}).fetchall()
+        for stop in stops:
+            lines = conn.execute(text(sql_lines), {"stop_id": stop.stop_id}).fetchall()
+            label = f"{stop.stop_id}: {stop.stop_name}"
+            if stop.platform_code:
+                label += f" ({stop.platform_code})"
+            if stop.location_type == 1:
+                label += " [station]"
+            if lines:
+                served = sorted({f"{line.line} → {line.headsign}" if line.headsign else str(line.line) for line in lines})
+                label += " - " + ", ".join(served[:6]) + (", ..." if len(served) > 6 else "")
+            stop_list.append({"value": f"{stop.stop_id}: {stop.stop_name}", "label": label})
+    _LOGGER.debug("Stops found for '%s': %s", search, stop_list)
+    return stop_list
+
+
+def get_stop_route_list(schedule, stop):
+    """The lines leaving a stop, one entry per direction with its headsigns."""
+    sql_routes = """
+        SELECT route.route_id, route.route_short_name, route.route_long_name, trip.direction_id,
+               group_concat(DISTINCT trip.trip_headsign) AS headsigns
+        FROM stop_times st
+        INNER JOIN trips trip ON trip.trip_id = st.trip_id
+        INNER JOIN routes route ON route.route_id = trip.route_id
+        WHERE st.stop_id IN (SELECT stop_id FROM stops WHERE stop_id = :stop_id OR parent_station = :stop_id)
+          AND EXISTS (
+            SELECT 1 FROM stop_times later
+            WHERE later.trip_id = st.trip_id AND later.stop_sequence > st.stop_sequence
+          )
+        GROUP BY route.route_id, trip.direction_id
+        ORDER BY route.route_short_name, route.route_id, trip.direction_id
+        """
+    with schedule.engine.connect() as conn:
+        rows = conn.execute(text(sql_routes), {"stop_id": _stop_id_of(stop)}).fetchall()
+    route_list = []
+    for row in rows:
+        line = row.route_short_name or row.route_long_name or row.route_id
+        headsigns = ", ".join(sorted(h for h in (row.headsigns or "").split(",") if h))
+        label = f"{line} → {headsigns}" if headsigns else f"{line} (direction {row.direction_id})"
+        route_list.append({"value": route_direction_key(row.route_id, row.direction_id), "label": label})
+    _LOGGER.debug("Routes at stop %s: %s", stop, route_list)
+    return route_list
+
+
+def get_stop_departures(self):
+    """The live timetable of one stop: its departures within the time range,
+    on the lines of the route filter, with realtime where configured."""
+    _LOGGER.debug("Get stop departures with data: %s", self._data)
+    if check_extracting(self.hass, self._data['gtfs_dir'], self._data['file']):
+        _LOGGER.warning("Cannot get departures on this datasource as still unpacking: %s", self._data["file"])
+        return []
+    offset = self._data["offset"]
+    now = dt_util.now().replace(tzinfo=None) + datetime.timedelta(minutes=offset)
+    time_range = str('+' + str(self._data.get("timerange", DEFAULT_STOP_DEPARTURES_TIMERANGE)) + ' minute')
+    time_range_history = str('-' + str(self._data.get("timerange_history", DEFAULT_LOCAL_STOP_TIMERANGE_HISTORY)) + ' minute')
+    rows = _fetch_local_stop_rows(
+        self._data["schedule"], None, None, None, time_range, time_range_history, now,
+        stop_id=_stop_id_of(self._data["departure_stop"]),
+    )
+    rows = _filter_stop_rows(rows, self._data.get("route_filter"))
+    return _stop_departures_of(_interpret_local_stop_rows(self, rows), self._data["max_departures"])
 
 
 async def update_gtfs_local_stops(hass, data): 

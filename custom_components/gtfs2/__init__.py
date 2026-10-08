@@ -8,7 +8,7 @@ from homeassistant.exceptions import ConfigEntryNotReady
 
 from datetime import timedelta
 
-from .const import DOMAIN, PLATFORMS, DEFAULT_PATH, DEFAULT_PATH_RT, DEFAULT_REFRESH_INTERVAL
+from .const import DOMAIN, PLATFORMS, DEFAULT_PATH, DEFAULT_PATH_RT, DEFAULT_REFRESH_INTERVAL, CONF_DEPARTURE_STOP
 from homeassistant.const import CONF_HOST
 from .coordinator import GTFSUpdateCoordinator, GTFSLocalStopUpdateCoordinator
 import voluptuous as vol
@@ -82,7 +82,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up GTFS from a config entry."""
     hass.data.setdefault(DOMAIN, {})
    
-    if entry.data.get('device_tracker_id',None):
+    if entry.data.get('device_tracker_id',None) or entry.data.get(CONF_DEPARTURE_STOP, None):
         coordinator = GTFSLocalStopUpdateCoordinator(hass, entry)
     else:
         coordinator = GTFSUpdateCoordinator(hass, entry)    

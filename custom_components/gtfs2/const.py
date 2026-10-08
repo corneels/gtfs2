@@ -14,6 +14,11 @@ DEFAULT_MAX_LOCAL_STOPS = 15
 # seconds a realtime response is shared between entries asking for the same url,
 # kept under the one minute refresh so an entry on its own never sees older data
 DEFAULT_RT_CACHE_TTL = 30
+# a stop's live timetable: refreshed every minute since its state is the next
+# departure, looking an hour ahead, and keeping the attribute list readable
+DEFAULT_STOP_DEPARTURES_REFRESH_INTERVAL = 1
+DEFAULT_STOP_DEPARTURES_TIMERANGE = 60
+DEFAULT_MAX_STOP_DEPARTURES = 20
 
 DEFAULT_NAME = "GTFS Sensor2"
 DEFAULT_PATH = "gtfs2"
@@ -294,6 +299,9 @@ CONF_OFFSET = "offset"
 CONF_REAL_TIME = "real_time"
 CONF_SOURCE_TIMEZONE_CORRECTION = "source_timezone_correction"
 CONF_MAX_LOCAL_STOPS = "max_local_stops"
+CONF_STOP_SEARCH = "stop_search"
+CONF_DEPARTURE_STOP = "departure_stop"
+CONF_ROUTE_FILTER = "route_filter"
 
 # gtfs_rt specific
 CONF_API_KEY = "api_key"
